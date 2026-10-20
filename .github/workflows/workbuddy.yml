@@ -1,15 +1,38 @@
 name: 🌱 WorkBuddy Daily
 
+# ─────────────────────────────────────────────────────────────
+# 定时签到工作流（GitHub Actions 版）
+#   · 三个时段自动跑：北京时间 07:00 / 12:00 / 23:30
+#   · 手动触发时可临时改子任务白/黑名单
+#   · 私有仓库：令牌状态提交回仓库（RT 不泄露，续期不中断）
+#   · 公开仓库 + 配了 GH_PAT：跑完自动把新 RT 写回 Secrets（同样不中断）
+# ─────────────────────────────────────────────────────────────
 on:
   schedule:
-    # 北京时间 07:00 / 12:00 / 23:30（GitHub cron 用 UTC，北京时间 = UTC+8）
-    - cron: "0 23 * * *"     # 07:00
-    - cron: "0 4 * * *"      # 12:00
-    - cron: "30 15 * * *"    # 23:30
-  workflow_dispatch:          # 支持手动触发
+    - cron: "0 23 * * *"     # 北京时间 07:00
+    - cron: "0 4 * * *"      # 北京时间 12:00
+    - cron: "30 15 * * *"    # 北京时间 23:30
+  workflow_dispatch:
+    inputs:
+      tasks:
+        description: "白名单子任务，如 checkin,travel（留空=按 Secret/全部）"
+        required: false
+        default: ""
+      skip_tasks:
+        description: "黑名单子任务，如 lottery,redeem（留空=按 Secret/不跳过）"
+        required: false
+        default: ""
+      mp_gap:
+        description: "mp 对话事件间隔秒数（留空=45）"
+        required: false
+        default: ""
+      query_only:
+        description: "只查询积分/用量，不跑任务（true/false）"
+        required: false
+        default: "false"
 
 permissions:
-  contents: write
+  contents: write          # 私有仓持久化令牌状态 / keepalive 提交需要
 
 concurrency:
   group: workbuddy
@@ -17,45 +40,117 @@ concurrency:
 
 jobs:
   run:
+    name: 签到主流程
     runs-on: ubuntu-latest
-    timeout-minutes: 45   # mp 对话任务按真人节奏上报（每条 45s±10s），账号多时耗时更长
+    timeout-minutes: 75    # 账号多 + mp 任务按真人节奏上报（45s±10s/条）时耗时更长
     env:
-      TZ: Asia/Shanghai   # runner 默认 UTC：不加会把日志时间与补签日期算错一天
+      TZ: Asia/Shanghai    # runner 默认 UTC，不加会把日志时间和补签日期算错一天
+      PYTHONUNBUFFERED: "1"
+      PYTHONIOENCODING: "utf-8"
+      # ── 必填 ──
+      WORKBUDDY_REFRESH_TOKEN: ${{ secrets.WORKBUDDY_REFRESH_TOKEN }}
+      # ── 推送（可选）──
+      PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+      BARK_URL: ${{ secrets.BARK_URL }}
+      WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
+      WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
+      WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+      DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+      DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
+      # ── 任务开关（手动触发优先，其次 Secret）──
+      WORKBUDDY_TASKS: ${{ github.event.inputs.tasks || secrets.WORKBUDDY_TASKS }}
+      WORKBUDDY_SKIP_TASKS: ${{ github.event.inputs.skip_tasks || secrets.WORKBUDDY_SKIP_TASKS }}
+      WORKBUDDY_MP_GAP: ${{ github.event.inputs.mp_gap || secrets.WORKBUDDY_MP_GAP }}
+      WORKBUDDY_ACTIVITY_STATE: ${{ secrets.WORKBUDDY_ACTIVITY_STATE }}
+      # ── 公开仓模式下用于自动轮换 Secret（可选）──
+      GH_PAT: ${{ secrets.GH_PAT }}
+
     steps:
-      - name: Checkout
+      - name: 检出仓库
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: 安装 Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
 
-      - name: Install deps
-        run: pip install requests
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
 
-      - name: Run WorkBuddy
-        env:
-          WORKBUDDY_REFRESH_TOKEN: ${{ secrets.WORKBUDDY_REFRESH_TOKEN }}
-          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
-          BARK_URL: ${{ secrets.BARK_URL }}
-          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
-          DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
-          DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
-          WORKBUDDY_TASKS: ${{ secrets.WORKBUDDY_TASKS }}
-          WORKBUDDY_SKIP_TASKS: ${{ secrets.WORKBUDDY_SKIP_TASKS }}
-          WORKBUDDY_MP_GAP: ${{ secrets.WORKBUDDY_MP_GAP }}
-        run: python workbuddy_daily.py
+      - name: 凭据自检
+        run: python .github/scripts/preflight.py
 
-      # ⚠️ 仅在【私有仓库】中持久化令牌状态；公开仓库会跳过，避免 RT 泄露
-      - name: Persist token state (private repo only)
+      - name: 运行 WorkBuddy
+        run: |
+          if [ "${{ github.event.inputs.query_only }}" = "true" ]; then
+            python workbuddy_daily.py --query
+          else
+            python workbuddy_daily.py
+          fi
+
+      # ── 私有仓库：把 wb_refresh_tokens.json 提交回仓库，RT 不外泄且续期不断 ──
+      - name: 持久化令牌状态（仅私有仓库）
         if: always() && github.event.repository.private == true
         run: |
+          if [ ! -f wb_refresh_tokens.json ]; then
+            echo "没有 wb_refresh_tokens.json，跳过"
+            exit 0
+          fi
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f wb_refresh_tokens.json 2>/dev/null || true
+          git add -f wb_refresh_tokens.json
           if git diff --cached --quiet; then
             echo "令牌状态无变化"
           else
             git commit -m "chore: 更新令牌状态 [skip ci]"
-            git push
+            git push || echo "::warning::git push 失败（分支保护？），本轮令牌状态未落库"
           fi
+
+      # ── 公开仓库：用 GH_PAT 调 API 把最新 RT 写回 Secret（不落地明文）──
+      - name: 轮换 Secret（公开仓库 + GH_PAT）
+        if: always() && github.event.repository.private == false
+        env:
+          GH_TOKEN: ${{ env.GH_PAT }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::notice::未配置 GH_PAT：公开仓模式下不会自动轮换 RT，请每月手动更新一次 WORKBUDDY_REFRESH_TOKEN"
+            exit 0
+          fi
+          VALUE="$(python .github/scripts/export_rt.py || true)"
+          if [ -z "${VALUE}" ]; then
+            echo "没有可轮换的令牌（本轮可能全部账号都无需续期）"
+            exit 0
+          fi
+          printf '%s' "${VALUE}" | gh secret set WORKBUDDY_REFRESH_TOKEN --repo "${GH_REPO}"
+          echo "✅ 已把最新 RT 写回 WORKBUDDY_REFRESH_TOKEN"
+          # 公开仓 60 天无提交会被自动禁用定时任务，这里顺手留一次心跳提交
+          mkdir -p .workbuddy
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .workbuddy/keepalive.txt
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f .workbuddy/keepalive.txt
+          if git diff --cached --quiet; then
+            :
+          else
+            git commit -m "chore(keepalive): 保持定时任务有效 [skip ci]"
+            git push || echo "::warning::keepalive 提交失败，忽略"
+          fi
+
+      - name: 运行摘要
+        if: always()
+        run: |
+          {
+            echo "### 🌱 WorkBuddy Daily"
+            echo ""
+            echo "- 触发方式: \`${{ github.event_name }}\`"
+            echo "- 仓库可见性: \`${{ github.event.repository.private }}\`"
+            echo "- 运行结果: \`${{ job.status }}\`"
+            echo "- 令牌持久化: 私有仓提交 / 公开仓 Secret 轮换"
+            echo ""
+            echo "完整日志见上方「运行 WorkBuddy」步骤。"
+          } >> "$GITHUB_STEP_SUMMARY"
